@@ -330,6 +330,12 @@ def parse_thinking_models(
     """
     is_thinking = starts_in_thinking
     accumulated = ""
+    pending_buffer: list[GenerationResponse] = []
+
+    def drain_pending(_is_thinking: bool):
+        for buffered in pending_buffer:
+            yield buffered.model_copy(update={"is_thinking": _is_thinking})
+        pending_buffer.clear()
 
     for response in responses:
         if response is None:
@@ -339,25 +345,30 @@ def parse_thinking_models(
         accumulated += response.text
 
         if response.finish_reason is not None:
+            yield from drain_pending(is_thinking)
             yield response.model_copy(update={"is_thinking": False})
             continue
 
         if accumulated == think_start and not is_thinking:
             is_thinking = True
             accumulated = ""
+            pending_buffer.clear()
             continue
         if accumulated == think_end and is_thinking:
             is_thinking = False
             accumulated = ""
+            pending_buffer.clear()
             continue
 
         if (think_start and accumulated == think_start[: len(accumulated)]) or (
             think_end and accumulated == think_end[: len(accumulated)]
         ):
+            pending_buffer.append(response)
             continue
 
         accumulated = ""
 
+        yield from drain_pending(is_thinking)
         yield response.model_copy(update={"is_thinking": is_thinking})
 
 
@@ -368,6 +379,8 @@ def parse_tool_calls(
 ) -> Generator[GenerationResponse | ToolCallResponse | None]:
     in_tool_call = False
     tool_call_text_parts: list[str] = []
+    accumulated_tool_calls: list[ToolCallItem] = []
+
     for response in responses:
         if response is None:
             yield None
@@ -375,6 +388,19 @@ def parse_tool_calls(
 
         if not in_tool_call and response.text.startswith(tool_parser.start_parsing):
             in_tool_call = True
+
+        if (
+            not in_tool_call
+            and accumulated_tool_calls
+            and (response.stats is not None or response.finish_reason is not None)
+        ):
+            yield ToolCallResponse(
+                tool_calls=accumulated_tool_calls,
+                usage=response.usage,
+                stats=response.stats,
+            )
+            accumulated_tool_calls.clear()
+            continue
 
         if not in_tool_call:
             yield response
@@ -396,9 +422,16 @@ def parse_tool_calls(
                 )
                 break
 
-            yield ToolCallResponse(
-                tool_calls=parsed, usage=response.usage, stats=response.stats
-            )
+            accumulated_tool_calls.extend(parsed)
+            if accumulated_tool_calls and (
+                response.finish_reason is not None or response.stats is not None
+            ):
+                yield ToolCallResponse(
+                    tool_calls=accumulated_tool_calls,
+                    usage=response.usage,
+                    stats=response.stats,
+                )
+                accumulated_tool_calls.clear()
             continue
 
         if response.finish_reason is not None:
@@ -413,3 +446,6 @@ def parse_tool_calls(
                 }
             )
             yield response
+
+    if not accumulated_tool_calls:
+        logger.warning("Tool calls should have all been emitted but were not")
