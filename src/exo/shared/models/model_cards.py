@@ -117,6 +117,21 @@ class VisionCardConfig(CamelCaseModel):
     processor_repo: str | None = None
 
 
+class SamplingValues(CamelCaseModel):
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+
+
+class SamplingDefaults(SamplingValues):
+    thinking: SamplingValues | None = None
+    non_thinking: SamplingValues | None = None
+
+
 class ModelCard(CamelCaseModel):
     model_id: ModelId
     storage_size: Memory
@@ -135,6 +150,7 @@ class ModelCard(CamelCaseModel):
     trust_remote_code: bool = True
     is_custom: bool = False
     vision: VisionCardConfig | None = None
+    sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
 
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":
@@ -351,7 +367,7 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
         index_data = ModelSafetensorsIndex.model_validate_json(await f.read())
 
     metadata = index_data.metadata
-    if metadata is not None:
+    if metadata is not None and metadata.total_size is not None:
         return Memory.from_bytes(metadata.total_size)
 
     info = model_info(model_id)
