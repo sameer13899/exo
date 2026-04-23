@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from functools import partial
 from inspect import signature
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -12,7 +12,7 @@ from mlx.nn.layers.distributed import (
     sum_gradients,
 )
 from mlx_lm.models.base import (
-    scaled_dot_product_attention,  # pyright: ignore[reportUnknownVariableType]
+    scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3MLP
@@ -59,13 +59,12 @@ from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
 from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
+from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
     from mlx_lm.models.cache import Cache
-
-LayerLoadedCallback = Callable[[int, int], None]  # (layers_loaded, total_layers)
 
 
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
@@ -276,8 +275,7 @@ def pipeline_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
     model_shard_meta: PipelineShardMetadata,
-    on_layer_loaded: LayerLoadedCallback | None,
-) -> nn.Module:
+) -> Generator[ModelLoadingResponse, None, nn.Module]:
     """
     Automatically parallelize a model across multiple devices.
     Args:
@@ -297,8 +295,7 @@ def pipeline_auto_parallel(
     total = len(layers)
     for i, layer in enumerate(layers):
         mx.eval(layer)  # type: ignore
-        if on_layer_loaded is not None:
-            on_layer_loaded(i, total)
+        yield ModelLoadingResponse(layers_loaded=i, total=total)
 
     layers[0] = PipelineFirstLayer(layers[0], device_rank, group=group)
     layers[-1] = PipelineLastLayer(
@@ -309,24 +306,20 @@ def pipeline_auto_parallel(
     )
 
     if isinstance(inner_model_instance, GptOssMoeModel):
-        inner_model_instance.layer_types = inner_model_instance.layer_types[  # type: ignore
+        inner_model_instance.layer_types = inner_model_instance.layer_types[
             start_layer:end_layer
         ]
         # We can assume the model has at least one layer thanks to placement.
         # If a layer type doesn't exist, we can set it to 0.
         inner_model_instance.swa_idx = (
             0
-            if "sliding_attention" not in inner_model_instance.layer_types  # type: ignore
-            else inner_model_instance.layer_types.index(  # type: ignore
-                "sliding_attention"
-            )
+            if "sliding_attention" not in inner_model_instance.layer_types
+            else inner_model_instance.layer_types.index("sliding_attention")
         )
         inner_model_instance.ga_idx = (
             0
-            if "full_attention" not in inner_model_instance.layer_types  # type: ignore
-            else inner_model_instance.layer_types.index(  # type: ignore
-                "full_attention"
-            )
+            if "full_attention" not in inner_model_instance.layer_types
+            else inner_model_instance.layer_types.index("full_attention")
         )
 
     if isinstance(inner_model_instance, Step35InnerModel):
@@ -460,8 +453,7 @@ def patch_tensor_model[T](model: T) -> T:
 def tensor_auto_parallel(
     model: nn.Module,
     group: mx.distributed.Group,
-    on_layer_loaded: LayerLoadedCallback | None,
-) -> nn.Module:
+) -> Generator[ModelLoadingResponse, None, nn.Module]:
     all_to_sharded_linear = partial(
         shard_linear,
         sharding="all-to-sharded",
@@ -595,7 +587,7 @@ def tensor_auto_parallel(
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
 
-    model = tensor_parallel_sharding_strategy.shard_model(model, on_layer_loaded)
+    model = yield from tensor_parallel_sharding_strategy.shard_model(model)
     return patch_tensor_model(model)
 
 
@@ -619,16 +611,14 @@ class TensorParallelShardingStrategy(ABC):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module: ...
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]: ...
 
 
 class LlamaShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(LlamaModel, model)
         total = len(model.layers)
         for i, layer in enumerate(model.layers):
@@ -646,8 +636,8 @@ class LlamaShardingStrategy(TensorParallelShardingStrategy):
             layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
             layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -681,8 +671,7 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(DeepseekV3Model, model)
         total = len(model.layers)
 
@@ -738,8 +727,8 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
                 layer.mlp.sharding_group = self.group
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
 
         return model
 
@@ -764,8 +753,7 @@ class GLM4MoeLiteShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(GLM4MoeLiteModel, model)
         total = len(model.layers)  # type: ignore
         for i, layer in enumerate(model.layers):  # type: ignore
@@ -816,8 +804,8 @@ class GLM4MoeLiteShardingStrategy(TensorParallelShardingStrategy):
                 layer.mlp = ShardedMoE(layer.mlp)  # type: ignore
                 layer.mlp.sharding_group = self.group  # type: ignore
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
 
         return model
 
@@ -891,7 +879,7 @@ class WrappedMiniMaxAttention(CustomMlxLayer):
             keys,
             values,
             cache=cache,
-            scale=self._original_layer.scale,  # type: ignore
+            scale=self._original_layer.scale,
             mask=mask,
         )
 
@@ -904,8 +892,7 @@ class MiniMaxShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(MiniMaxModel, model)
         total = len(model.layers)
         for i, layer in enumerate(model.layers):
@@ -931,11 +918,11 @@ class MiniMaxShardingStrategy(TensorParallelShardingStrategy):
             self.all_to_sharded_linear_in_place(
                 layer.block_sparse_moe.switch_mlp.up_proj
             )
-            layer.block_sparse_moe = ShardedMoE(layer.block_sparse_moe)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-            layer.block_sparse_moe.sharding_group = self.group  # pyright: ignore[reportAttributeAccessIssue]
+            layer.block_sparse_moe = ShardedMoE(layer.block_sparse_moe)  # type: ignore
+            layer.block_sparse_moe.sharding_group = self.group
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -943,8 +930,7 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(
             Qwen3Model
             | Qwen3MoeModel
@@ -1099,8 +1085,8 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
                 layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -1108,8 +1094,7 @@ class Glm4MoeShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(Glm4MoeModel, model)
         total = len(model.layers)
         for i, layer in enumerate(model.layers):
@@ -1145,8 +1130,8 @@ class Glm4MoeShardingStrategy(TensorParallelShardingStrategy):
                 layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -1154,8 +1139,7 @@ class GptOssShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(GptOssMoeModel, model)
         total = len(model.layers)
 
@@ -1184,10 +1168,10 @@ class GptOssShardingStrategy(TensorParallelShardingStrategy):
             self.all_to_sharded_linear_in_place(layer.mlp.experts.up_proj)
 
             layer.mlp = ShardedMoE(layer.mlp)  # type: ignore
-            layer.mlp.sharding_group = self.group  # pyright: ignore[reportAttributeAccessIssue]
+            layer.mlp.sharding_group = self.group
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -1195,8 +1179,7 @@ class Step35ShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(Step35Model, model)
         total = len(model.layers)
 
@@ -1229,8 +1212,8 @@ class Step35ShardingStrategy(TensorParallelShardingStrategy):
                 self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 
@@ -1238,8 +1221,7 @@ class NemotronHShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(NemotronHModel, model)
         rank = self.group.rank()
         total = len(model.layers)
@@ -1272,8 +1254,7 @@ class NemotronHShardingStrategy(TensorParallelShardingStrategy):
                 layer.mixer = mixer  # pyright: ignore[reportAttributeAccessIssue]
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
     def _shard_mamba2_mixer(self, mixer: NemotronHMamba2Mixer, rank: int) -> None:
@@ -1380,8 +1361,7 @@ class Gemma4ShardingStrategy(TensorParallelShardingStrategy):
     def shard_model(
         self,
         model: nn.Module,
-        on_layer_loaded: LayerLoadedCallback | None,
-    ) -> nn.Module:
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(Gemma4Model, model)
         layers = model.language_model.model.layers
         total = len(layers)
@@ -1390,9 +1370,11 @@ class Gemma4ShardingStrategy(TensorParallelShardingStrategy):
 
             attn = layer.self_attn
             attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
-            attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
-            if not attn.use_k_eq_v:
-                attn.v_proj = self.all_to_sharded_linear(attn.v_proj)
+            has_kv: bool = cast(bool, attn.has_kv)
+            if has_kv:
+                attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
+                if not attn.use_k_eq_v:
+                    attn.v_proj = self.all_to_sharded_linear(attn.v_proj)
             attn.o_proj = self.sharded_to_all_linear(attn.o_proj)
             attn.n_heads //= self.N
             attn.n_kv_heads //= self.N
@@ -1409,6 +1391,5 @@ class Gemma4ShardingStrategy(TensorParallelShardingStrategy):
                 layer.experts.sharding_group = self.group
 
             mx.eval(layer)
-            if on_layer_loaded is not None:
-                on_layer_loaded(i, total)
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model

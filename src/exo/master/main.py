@@ -410,12 +410,17 @@ class Master:
                         continue
 
                     logger.debug(f"Master indexing event: {str(event)[:100]}")
+
+                    event = event.model_copy(
+                        update={"_master_time_stamp": datetime.now(tz=timezone.utc)}
+                    )
+                    if isinstance(event, NodeGatheredInfo):
+                        event = event.model_copy(
+                            update={"when": str(datetime.now(tz=timezone.utc))}
+                        )
+
                     indexed = IndexedEvent(event=event, idx=len(self._event_log))
                     self.state = apply(self.state, indexed)
-
-                    event._master_time_stamp = datetime.now(tz=timezone.utc)  # pyright: ignore[reportPrivateUsage]
-                    if isinstance(event, NodeGatheredInfo):
-                        event.when = str(datetime.now(tz=timezone.utc))
 
                     self._event_log.append(event)
                     await self._send_event(indexed)
