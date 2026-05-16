@@ -160,7 +160,7 @@ exclude = [
   "**/rust",
   "**/.github",
 ]
-stubPath = ".mlx_typings"
+stubPath = ".typings"
 
 [[tool.basedpyright.executionEnvironments]]
 root = "src/exo/worker/engines/image"
@@ -240,11 +240,7 @@ torchaudio = ["torch"]
 ###
 
 [tool.ruff]
-extend-exclude = [
-  "*mlx_typings/**",
-  "rust/exo_pyo3_bindings/**",
-  "bench/vendor/**",
-]
+extend-exclude = [".typings/**", "rust/exo_pyo3_bindings/**", "bench/vendor/**"]
 
 [tool.ruff.lint]
 extend-select = ["I", "N", "B", "A", "PIE", "SIM"]
@@ -254,5 +250,5 @@ pythonpath = "."
 asyncio_mode = "auto"
 markers = ["slow: marks tests as slow (deselected by default)"]
 env = ["EXO_TESTS=1"]
-addopts = "-m 'not slow' --ignore=tests"
+addopts = "-m 'not slow' --ignore=tests --ignore=tmp"
 filterwarnings = ["ignore:builtin type Swig:DeprecationWarning"]
